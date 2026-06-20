@@ -1,0 +1,24 @@
+{
+  "apiBaseUrl": "https://api.example.com/v1",
+  "apiKey": "put-your-api-key-here",
+  "model": "gpt-4o-mini",
+  "targetLanguage": "Simplified Chinese",
+  "watchDirs": [
+    "%USERPROFILE%\\Videos",
+    "%USERPROFILE%\\Downloads",
+    "%USERPROFILE%\\Desktop"
+  ],
+  "recursive": true,
+  "scanIntervalSeconds": 20,
+  "batchSize": 20,
+  "temperature": 0.2,
+  "maxTokens": 2000,
+  "requestTimeoutSeconds": 120,
+  "retryCount": 2,
+  "translateExistingOnStart": false,
+  "writeTranslated": true,
+  "writeBilingual": true,
+  "translatedSuffix": "zh-CN",
+  "bilingualSuffix": "bilingual"
+}
+

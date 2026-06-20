@@ -1,0 +1,8 @@
+config.json
+*.local.json
+logs/
+cache/
+.env
+.env.*
+!.env.example
+
