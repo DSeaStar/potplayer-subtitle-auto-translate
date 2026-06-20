@@ -153,9 +153,47 @@ function Split-TextBlocks {
     return @($normalized -split "\n[ \t]*\n")
 }
 
+function Read-TextFileSmart {
+    param([string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) {
+        return [System.Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) {
+        return [System.Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2)
+    }
+
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    try {
+        return $strictUtf8.GetString($bytes)
+    }
+    catch {
+        # Common subtitle encodings on Windows: Japanese, Simplified Chinese,
+        # Korean, Traditional Chinese, and the current ANSI code page.
+        $codePages = @(932, 936, 949, 950, [System.Text.Encoding]::Default.CodePage) | Select-Object -Unique
+        foreach ($cp in $codePages) {
+            try {
+                return [System.Text.Encoding]::GetEncoding($cp).GetString($bytes)
+            }
+            catch {
+            }
+        }
+        return [System.Text.Encoding]::Default.GetString($bytes)
+    }
+}
+
+function Write-Utf8BomText {
+    param([string]$Path, [string]$Text)
+    $encoding = New-Object System.Text.UTF8Encoding($true)
+    [System.IO.File]::WriteAllText($Path, $Text, $encoding)
+}
+
 function Parse-Srt {
     param([string]$Path)
-    $content = Get-Content -LiteralPath $Path -Raw
+    $content = Read-TextFileSmart $Path
     $blocks = Split-TextBlocks $content
     $cues = @()
     foreach ($block in $blocks) {
@@ -206,7 +244,7 @@ function Render-Srt {
 
 function Parse-Vtt {
     param([string]$Path)
-    $content = Get-Content -LiteralPath $Path -Raw
+    $content = Read-TextFileSmart $Path
     $blocks = Split-TextBlocks $content
     $header = @()
     $cues = @()
@@ -267,7 +305,7 @@ function Render-Vtt {
 
 function Parse-Ass {
     param([string]$Path)
-    $content = Get-Content -LiteralPath $Path -Raw
+    $content = Read-TextFileSmart $Path
     $lines = @($content -replace "`r`n", "`n" -replace "`r", "`n" -split "`n")
     $inEvents = $false
     $fields = @()
@@ -383,6 +421,67 @@ function ConvertFrom-ModelJsonArray {
     }
 }
 
+function Read-WebResponseUtf8 {
+    param($Response)
+    $stream = $Response.GetResponseStream()
+    $memory = New-Object System.IO.MemoryStream
+    try {
+        $buffer = New-Object byte[] 8192
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $memory.Write($buffer, 0, $read)
+        }
+        return [System.Text.Encoding]::UTF8.GetString($memory.ToArray())
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $memory.Dispose()
+    }
+}
+
+function Invoke-ChatCompletionUtf8 {
+    param($Config, [string]$Body)
+    $uri = "$($Config.ApiBaseUrl)/chat/completions"
+    $request = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($uri)
+    $request.Method = "POST"
+    $request.Accept = "application/json"
+    $request.ContentType = "application/json; charset=utf-8"
+    $request.UserAgent = "PotPlayerSubtitleAutoTranslate/1.0"
+    $request.Timeout = $Config.RequestTimeoutSeconds * 1000
+    $request.ReadWriteTimeout = $Config.RequestTimeoutSeconds * 1000
+    $request.Headers["Authorization"] = "Bearer $($Config.ApiKey)"
+
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    $request.ContentLength = $bodyBytes.Length
+    $requestStream = $request.GetRequestStream()
+    try {
+        $requestStream.Write($bodyBytes, 0, $bodyBytes.Length)
+    }
+    finally {
+        $requestStream.Dispose()
+    }
+
+    $response = $null
+    try {
+        $response = [System.Net.HttpWebResponse]$request.GetResponse()
+        $text = Read-WebResponseUtf8 $response
+        $status = [int]$response.StatusCode
+        if ($status -lt 200 -or $status -ge 300) {
+            throw "HTTP ${status}: $text"
+        }
+        return $text | ConvertFrom-Json
+    }
+    catch [System.Net.WebException] {
+        if ($null -ne $_.Exception.Response) {
+            $errorText = Read-WebResponseUtf8 $_.Exception.Response
+            throw "HTTP error: $errorText"
+        }
+        throw
+    }
+    finally {
+        if ($null -ne $response) { $response.Dispose() }
+    }
+}
+
 function Invoke-TranslationBatch {
     param($Config, [string[]]$Texts)
     if ($Texts.Count -eq 0) { return @() }
@@ -410,16 +509,10 @@ Do not add explanations, indexes, markdown, or extra fields.
         stream = $false
     } | ConvertTo-Json -Depth 10 -Compress
 
-    $headers = @{
-        "Authorization" = "Bearer $($Config.ApiKey)"
-        "Content-Type" = "application/json"
-    }
-
-    $uri = "$($Config.ApiBaseUrl)/chat/completions"
     $lastError = $null
     for ($attempt = 0; $attempt -le $Config.RetryCount; $attempt++) {
         try {
-            $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body $body -TimeoutSec $Config.RequestTimeoutSeconds
+            $response = Invoke-ChatCompletionUtf8 $Config $body
             $content = [string]$response.choices[0].message.content
             $items = @(ConvertFrom-ModelJsonArray $content)
             if ($items.Count -ne $Texts.Count) {
@@ -552,11 +645,11 @@ function Convert-SubtitleFile {
     Add-Translations $doc $Config
 
     if ($Config.WriteTranslated) {
-        Render-SubtitleDocument $doc "translated" | Set-Content -LiteralPath $translatedPath -Encoding UTF8
+        Write-Utf8BomText $translatedPath (Render-SubtitleDocument $doc "translated")
         Write-Log "Wrote translated subtitle: $translatedPath"
     }
     if ($Config.WriteBilingual) {
-        Render-SubtitleDocument $doc "bilingual" | Set-Content -LiteralPath $bilingualPath -Encoding UTF8
+        Write-Utf8BomText $bilingualPath (Render-SubtitleDocument $doc "bilingual")
         Write-Log "Wrote bilingual subtitle: $bilingualPath"
     }
 }
