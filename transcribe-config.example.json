@@ -1,0 +1,41 @@
+{
+  "whisperExe": "D:\\Program Files\\DAUM\\PotPlayer\\Engine\\Faster-Whisper-XXL\\faster-whisper-xxl.exe",
+  "model": "D:\\Program Files\\DAUM\\PotPlayer\\Model\\faster-whisper-large-v3-turbo",
+  "watchDirs": [
+    "%USERPROFILE%\\Videos",
+    "%USERPROFILE%\\Downloads",
+    "%USERPROFILE%\\Desktop"
+  ],
+  "recursive": true,
+  "scanIntervalSeconds": 30,
+  "stableSeconds": 60,
+  "transcribeExistingOnStart": false,
+  "videoExtensions": [
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".m4v",
+    ".ts",
+    ".m2ts"
+  ],
+  "subtitleExtensions": [
+    ".srt",
+    ".ass",
+    ".ssa",
+    ".vtt"
+  ],
+  "outputFormat": "srt",
+  "outputDir": "source",
+  "language": "",
+  "device": "",
+  "computeType": "auto",
+  "standardAsia": true,
+  "beepOff": true,
+  "skipExisting": true,
+  "extraArgs": []
+}
+
