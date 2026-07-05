@@ -33,6 +33,48 @@ function Write-Log {
     Write-Host $line
 }
 
+function Set-NativeUtf8Output {
+    try {
+        $encoding = New-Object System.Text.UTF8Encoding($false)
+        [Console]::OutputEncoding = $encoding
+        $script:OutputEncoding = $encoding
+    }
+    catch {
+        Write-Log ("Unable to switch native output decoding to UTF-8: {0}" -f $_.Exception.Message)
+    }
+}
+
+function Repair-SubtitleEncoding {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return "missing"
+    }
+
+    $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    if (@(".srt", ".ass", ".ssa", ".vtt") -notcontains $ext) {
+        return "skipped"
+    }
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        return "unchanged"
+    }
+
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    try {
+        $text = $strictUtf8.GetString($bytes)
+    }
+    catch {
+        Write-Log "Leaving subtitle encoding unchanged because it is not valid UTF-8: $Path"
+        return "unchanged"
+    }
+
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    [System.IO.File]::WriteAllText($Path, $text, $utf8Bom)
+    Write-Log "Normalized subtitle encoding to UTF-8 BOM: $Path"
+    return "normalized"
+}
+
 function Read-Config {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -222,6 +264,7 @@ function Invoke-VideoTranscription {
     Write-Log "Starting transcription: $VideoPath"
     Write-Log ("Whisper args: " + ($args -join " "))
 
+    Set-NativeUtf8Output
     $output = & $Config.WhisperExe @args 2>&1
     $exitCode = $LASTEXITCODE
     foreach ($line in $output) {
@@ -229,22 +272,29 @@ function Invoke-VideoTranscription {
             Write-Log "whisper: $line"
         }
     }
-    if ($exitCode -ne 0) {
-        throw "Whisper exited with code $exitCode"
-    }
     $joinedOutput = ($output | ForEach-Object { [string]$_ }) -join "`n"
-    if ($joinedOutput -match "Unknown model|Traceback|error:|Exception") {
-        throw "Whisper reported an error. Check watcher.log for details."
-    }
+    $reportedError = ($joinedOutput -match "Unknown model|Traceback|error:|Exception")
 
     $after = @(Get-MatchingSubtitleFiles $VideoPath $Config | ForEach-Object { $_.FullName })
     $created = @($after | Where-Object { $before -notcontains $_ })
     if ($created.Count -gt 0) {
         foreach ($subtitle in $created) {
+            Repair-SubtitleEncoding $subtitle | Out-Null
             Write-Log "Created subtitle: $subtitle"
         }
     }
-    else {
+
+    if ($reportedError) {
+        throw "Whisper reported an error. Check watcher.log for details."
+    }
+    if ($exitCode -ne 0) {
+        if ($created.Count -gt 0) {
+            Write-Log "Whisper exited with code $exitCode after creating subtitle; keeping created output."
+            return "done"
+        }
+        throw "Whisper exited with code $exitCode"
+    }
+    if ($created.Count -eq 0) {
         Write-Log "Transcription finished; no subtitle was created for: $VideoPath"
         return "skipped"
     }

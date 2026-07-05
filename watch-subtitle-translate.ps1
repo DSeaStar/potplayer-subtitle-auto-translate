@@ -1,6 +1,8 @@
 param(
     [string]$ConfigPath = (Join-Path $env:APPDATA "PotPlayerSubtitleAutoTranslate\config.json"),
     [string]$Once = "",
+    [string]$InternalBatchPath = "",
+    [string]$InternalOutputPath = "",
     [switch]$NoWatch
 )
 
@@ -32,6 +34,14 @@ function Write-Log {
     Write-Host $line
 }
 
+function Limit-LogText {
+    param([string]$Text, [int]$MaxLength = 500)
+    if ($null -eq $Text) { return "" }
+    if ($MaxLength -lt 20) { $MaxLength = 20 }
+    if ($Text.Length -le $MaxLength) { return $Text }
+    return ("{0}... [truncated {1} chars]" -f $Text.Substring(0, $MaxLength), ($Text.Length - $MaxLength))
+}
+
 function Read-Config {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -48,6 +58,34 @@ function Read-Config {
     if ($model.Trim().Length -eq 0) { throw "config.model is required" }
 
     $apiBaseUrl = $apiBaseUrl.TrimEnd("/")
+    $modelPool = @()
+    foreach ($provider in @(Get-Prop $cfg "modelPool" @())) {
+        $providerModel = [string](Get-Prop $provider "model" "")
+        if ($providerModel.Trim().Length -eq 0) {
+            throw "config.modelPool entries require model"
+        }
+        $providerApiBaseUrl = [string](Get-Prop $provider "apiBaseUrl" $apiBaseUrl)
+        $providerApiKey = [string](Get-Prop $provider "apiKey" $apiKey)
+        if ($providerApiBaseUrl.Trim().Length -eq 0) {
+            throw "config.modelPool entries require apiBaseUrl or top-level apiBaseUrl"
+        }
+        if ($providerApiKey.Trim().Length -eq 0) {
+            throw "config.modelPool entries require apiKey or top-level apiKey"
+        }
+        $modelPool += [pscustomobject]@{
+            ApiBaseUrl = $providerApiBaseUrl.TrimEnd("/")
+            ApiKey = $providerApiKey
+            Model = $providerModel
+        }
+    }
+    if ($modelPool.Count -eq 0) {
+        $modelPool = @([pscustomobject]@{
+            ApiBaseUrl = $apiBaseUrl
+            ApiKey = $apiKey
+            Model = $model
+        })
+    }
+
     $watchDirs = @()
     foreach ($dir in @(Get-Prop $cfg "watchDirs" @())) {
         $expanded = Expand-PathValue ([string]$dir)
@@ -60,11 +98,13 @@ function Read-Config {
         ApiBaseUrl = $apiBaseUrl
         ApiKey = $apiKey
         Model = $model
+        ModelPool = $modelPool
         TargetLanguage = [string](Get-Prop $cfg "targetLanguage" "Simplified Chinese")
         WatchDirs = $watchDirs
         Recursive = [bool](Get-Prop $cfg "recursive" $true)
         ScanIntervalSeconds = [int](Get-Prop $cfg "scanIntervalSeconds" 20)
         BatchSize = [int](Get-Prop $cfg "batchSize" 20)
+        MaxParallelRequests = [int](Get-Prop $cfg "maxParallelRequests" 1)
         Temperature = [double](Get-Prop $cfg "temperature" 0.2)
         MaxTokens = [int](Get-Prop $cfg "maxTokens" 2000)
         RequestTimeoutSeconds = [int](Get-Prop $cfg "requestTimeoutSeconds" 120)
@@ -116,6 +156,26 @@ function Save-JsonMap {
 function Get-CacheKey {
     param($Config, [string]$Text)
     return Get-Sha256Text ("v1|{0}|{1}|{2}" -f $Config.Model, $Config.TargetLanguage, $Text)
+}
+
+function Select-ProviderConfig {
+    param($Config, [int]$ProviderIndex)
+    $pool = @($Config.ModelPool)
+    if ($pool.Count -eq 0) {
+        return $Config
+    }
+
+    $index = $ProviderIndex % $pool.Count
+    if ($index -lt 0) { $index = 0 }
+    $provider = $pool[$index]
+    $props = [ordered]@{}
+    foreach ($prop in $Config.PSObject.Properties) {
+        $props[$prop.Name] = $prop.Value
+    }
+    $props["ApiBaseUrl"] = $provider.ApiBaseUrl
+    $props["ApiKey"] = $provider.ApiKey
+    $props["Model"] = $provider.Model
+    return [pscustomobject]$props
 }
 
 function Normalize-SubtitleText {
@@ -446,6 +506,7 @@ function Invoke-ChatCompletionUtf8 {
     $request.Accept = "application/json"
     $request.ContentType = "application/json; charset=utf-8"
     $request.UserAgent = "PotPlayerSubtitleAutoTranslate/1.0"
+    $request.KeepAlive = $false
     $request.Timeout = $Config.RequestTimeoutSeconds * 1000
     $request.ReadWriteTimeout = $Config.RequestTimeoutSeconds * 1000
     $request.Headers["Authorization"] = "Bearer $($Config.ApiKey)"
@@ -511,6 +572,7 @@ Do not add explanations, indexes, markdown, or extra fields.
 
     $lastError = $null
     for ($attempt = 0; $attempt -le $Config.RetryCount; $attempt++) {
+        Write-Log ("API request attempt {0}/{1} for {2} subtitles" -f ($attempt + 1), ($Config.RetryCount + 1), $Texts.Count)
         try {
             $response = Invoke-ChatCompletionUtf8 $Config $body
             $content = [string]$response.choices[0].message.content
@@ -522,12 +584,159 @@ Do not add explanations, indexes, markdown, or extra fields.
         }
         catch {
             $lastError = $_
+            Write-Log ("API request failed on attempt {0}/{1}: {2}" -f ($attempt + 1), ($Config.RetryCount + 1), (Limit-LogText $_.Exception.Message))
             if ($attempt -lt $Config.RetryCount) {
                 Start-Sleep -Seconds ([Math]::Min(10, 2 + $attempt * 2))
             }
         }
     }
     throw $lastError
+}
+
+function Invoke-TranslationBatchWithProviderFallback {
+    param($Config, [int]$ProviderIndex, [string[]]$Texts)
+    $poolCount = [Math]::Max(1, @($Config.ModelPool).Count)
+    $lastError = $null
+
+    for ($attempt = 0; $attempt -lt $poolCount; $attempt++) {
+        $currentProviderIndex = ($ProviderIndex + $attempt) % $poolCount
+        $providerConfig = Select-ProviderConfig $Config $currentProviderIndex
+        if ($attempt -gt 0) {
+            Write-Log ("Retrying batch with fallback model {0}" -f $providerConfig.Model)
+        }
+        try {
+            return Invoke-TranslationBatch $providerConfig $Texts
+        }
+        catch {
+            $lastError = $_
+            Write-Log ("Model {0} failed for batch: {1}" -f $providerConfig.Model, (Limit-LogText $_.Exception.Message))
+        }
+    }
+
+    throw $lastError
+}
+
+function Invoke-InternalBatch {
+    param($Config, [string]$BatchPath, [string]$OutputPath)
+    $payload = Get-Content -LiteralPath $BatchPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $texts = @($payload.texts | ForEach-Object { [string]$_ })
+    $providerIndex = 0
+    if ($payload.PSObject.Properties.Name -contains "providerIndex") {
+        $providerIndex = [int]$payload.providerIndex
+    }
+    $workerConfig = Select-ProviderConfig $Config $providerIndex
+    Write-Log ("Worker translating {0} subtitles with model {1}" -f $texts.Count, $workerConfig.Model)
+    $translations = Invoke-TranslationBatchWithProviderFallback $Config $providerIndex $texts
+    $result = @{ translations = $translations } | ConvertTo-Json -Depth 8
+    Set-Content -LiteralPath $OutputPath -Value $result -Encoding UTF8
+}
+
+function Start-TranslationWorker {
+    param([string]$BatchPath, [string]$OutputPath)
+    $powershell = (Get-Command powershell.exe).Source
+    $args = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", "`"$PSCommandPath`"",
+        "-ConfigPath", "`"$ConfigPath`"",
+        "-InternalBatchPath", "`"$BatchPath`"",
+        "-InternalOutputPath", "`"$OutputPath`""
+    ) -join " "
+    return Start-Process -FilePath $powershell -ArgumentList $args -WindowStyle Hidden -PassThru
+}
+
+function Invoke-TranslationBatchesParallel {
+    param($Config, [object[]]$Batches, [scriptblock]$OnBatchCompleted = $null)
+    $results = @{}
+    if ($Batches.Count -eq 0) {
+        return $results
+    }
+
+    $parallel = [Math]::Max(1, [int]$Config.MaxParallelRequests)
+    if ($parallel -le 1) {
+        foreach ($batch in $Batches) {
+            $providerConfig = Select-ProviderConfig $Config $batch.ProviderIndex
+            Write-Log ("Translating batch {0}-{1} of {2} with model {3}" -f $batch.Start, $batch.End, $batch.Total, $providerConfig.Model)
+            $translated = Invoke-TranslationBatchWithProviderFallback $Config $batch.ProviderIndex $batch.Texts
+            $results[[int]$batch.Index] = $translated
+            if ($null -ne $OnBatchCompleted) {
+                & $OnBatchCompleted $batch $translated
+            }
+        }
+        return $results
+    }
+
+    $jobDir = Join-Path (Get-UserDataDir) "jobs"
+    New-Item -ItemType Directory -Force -Path $jobDir | Out-Null
+    $queue = New-Object System.Collections.Queue
+    foreach ($batch in $Batches) {
+        $queue.Enqueue($batch)
+    }
+    $running = New-Object System.Collections.ArrayList
+
+    try {
+        while ($queue.Count -gt 0 -or $running.Count -gt 0) {
+            while ($queue.Count -gt 0 -and $running.Count -lt $parallel) {
+                $batch = $queue.Dequeue()
+                $id = [guid]::NewGuid().ToString("N")
+                $inputPath = Join-Path $jobDir "$id.input.json"
+                $outputPath = Join-Path $jobDir "$id.output.json"
+                $providerConfig = Select-ProviderConfig $Config $batch.ProviderIndex
+                @{ texts = $batch.Texts; providerIndex = $batch.ProviderIndex } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $inputPath -Encoding UTF8
+                Write-Log ("Translating batch {0}-{1} of {2} in parallel slot with model {3}" -f $batch.Start, $batch.End, $batch.Total, $providerConfig.Model)
+                $process = Start-TranslationWorker $inputPath $outputPath
+                [void]$running.Add([pscustomobject]@{
+                    Process = $process
+                    Batch = $batch
+                    InputPath = $inputPath
+                    OutputPath = $outputPath
+                })
+            }
+
+            Start-Sleep -Milliseconds 500
+            for ($i = $running.Count - 1; $i -ge 0; $i--) {
+                $job = $running[$i]
+                $job.Process.Refresh()
+                if (-not $job.Process.HasExited) {
+                    continue
+                }
+
+                if ($job.Process.ExitCode -ne 0) {
+                    throw "Translation worker failed for batch $($job.Batch.Start)-$($job.Batch.End) with exit code $($job.Process.ExitCode)"
+                }
+                if (-not (Test-Path -LiteralPath $job.OutputPath -PathType Leaf)) {
+                    throw "Translation worker did not write output for batch $($job.Batch.Start)-$($job.Batch.End)"
+                }
+
+                $payload = Get-Content -LiteralPath $job.OutputPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $translated = @($payload.translations | ForEach-Object { [string]$_ })
+                if ($translated.Count -ne $job.Batch.Texts.Count) {
+                    throw "Translation worker returned $($translated.Count) items for batch $($job.Batch.Start)-$($job.Batch.End), expected $($job.Batch.Texts.Count)"
+                }
+                $results[[int]$job.Batch.Index] = $translated
+                if ($null -ne $OnBatchCompleted) {
+                    & $OnBatchCompleted $job.Batch $translated
+                }
+                Remove-Item -LiteralPath $job.InputPath, $job.OutputPath -Force -ErrorAction SilentlyContinue
+                $running.RemoveAt($i)
+            }
+        }
+    }
+    finally {
+        foreach ($job in @($running)) {
+            try {
+                $job.Process.Refresh()
+                if (-not $job.Process.HasExited) {
+                    Stop-Process -Id $job.Process.Id -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+            }
+            Remove-Item -LiteralPath $job.InputPath, $job.OutputPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    return $results
 }
 
 function Add-Translations {
@@ -552,16 +761,38 @@ function Add-Translations {
     }
 
     $keys = @($pending.Keys)
+    $batches = @()
+    $providerCount = [Math]::Max(1, @($Config.ModelPool).Count)
     for ($offset = 0; $offset -lt $keys.Count; $offset += $Config.BatchSize) {
         $take = [Math]::Min($Config.BatchSize, $keys.Count - $offset)
         $batchKeys = @($keys[$offset..($offset + $take - 1)])
         $texts = @($batchKeys | ForEach-Object { [string]$pending[$_] })
-        Write-Log ("Translating batch {0}-{1} of {2}" -f ($offset + 1), ($offset + $take), $keys.Count)
-        $translated = Invoke-TranslationBatch $Config $texts
-        for ($i = 0; $i -lt $batchKeys.Count; $i++) {
-            $cache[$batchKeys[$i]] = [string]$translated[$i]
+        $batchIndex = $batches.Count
+        $batches += [pscustomobject]@{
+            Index = $batchIndex
+            Start = $offset + 1
+            End = $offset + $take
+            Total = $keys.Count
+            BatchKeys = $batchKeys
+            Texts = $texts
+            ProviderIndex = $batchIndex % $providerCount
+        }
+    }
+
+    $saveBatch = {
+        param($batch, $translated)
+        $translated = @($translated)
+        for ($i = 0; $i -lt $batch.BatchKeys.Count; $i++) {
+            $cache[$batch.BatchKeys[$i]] = [string]$translated[$i]
         }
         Save-JsonMap $cache $cachePath
+    }
+
+    $batchResults = Invoke-TranslationBatchesParallel $Config $batches $saveBatch
+    foreach ($batch in $batches) {
+        if (-not $batchResults.ContainsKey([int]$batch.Index)) {
+            throw "Missing translation result for batch $($batch.Start)-$($batch.End)"
+        }
     }
 
     foreach ($cue in $Doc.Cues) {
@@ -620,19 +851,19 @@ function Wait-FileStable {
 function Convert-SubtitleFile {
     param([string]$Path, $Config, [switch]$Force)
     $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
-    if (@(".srt", ".vtt", ".ass") -notcontains $ext) { return }
-    if (Test-GeneratedOutputName $Path $Config) { return }
+    if (@(".srt", ".vtt", ".ass") -notcontains $ext) { return "skipped" }
+    if (Test-GeneratedOutputName $Path $Config) { return "skipped" }
 
     $translatedPath = Get-OutputPath $Path $Config.TranslatedSuffix
     $bilingualPath = Get-OutputPath $Path $Config.BilingualSuffix
     if (-not $Force -and (Test-Path -LiteralPath $translatedPath) -and (Test-Path -LiteralPath $bilingualPath)) {
         Write-Log "Skipping already translated file: $Path"
-        return
+        return "skipped"
     }
 
     if (-not (Wait-FileStable $Path)) {
         Write-Log "Skipping unstable file: $Path"
-        return
+        return "pending"
     }
 
     Write-Log "Reading subtitle: $Path"
@@ -652,6 +883,7 @@ function Convert-SubtitleFile {
         Write-Utf8BomText $bilingualPath (Render-SubtitleDocument $doc "bilingual")
         Write-Log "Wrote bilingual subtitle: $bilingualPath"
     }
+    return "done"
 }
 
 function Get-CandidateSubtitleFiles {
@@ -695,14 +927,17 @@ function Watch-Subtitles {
                 }
 
                 if (-not $state.ContainsKey($path) -or $state[$path] -ne $ticks) {
+                    $status = "failed"
                     try {
-                        Convert-SubtitleFile $path $Config
+                        $status = Convert-SubtitleFile $path $Config
                     }
                     catch {
-                        Write-Log ("Error translating {0}: {1}" -f $path, $_.Exception.Message)
+                        Write-Log ("Error translating {0}: {1}" -f $path, (Limit-LogText $_.Exception.Message))
                     }
-                    $state[$path] = $ticks
-                    Save-JsonMap $state $statePath
+                    if ($status -eq "done" -or $status -eq "skipped") {
+                        $state[$path] = $ticks
+                        Save-JsonMap $state $statePath
+                    }
                 }
             }
 
@@ -719,6 +954,14 @@ function Watch-Subtitles {
 }
 
 $config = Read-Config $ConfigPath
+
+if ($InternalBatchPath.Trim().Length -gt 0 -or $InternalOutputPath.Trim().Length -gt 0) {
+    if ($InternalBatchPath.Trim().Length -eq 0 -or $InternalOutputPath.Trim().Length -eq 0) {
+        throw "Both -InternalBatchPath and -InternalOutputPath are required for internal batch mode."
+    }
+    Invoke-InternalBatch $config (Expand-PathValue $InternalBatchPath) (Expand-PathValue $InternalOutputPath)
+    exit 0
+}
 
 if ($Once.Trim().Length -gt 0) {
     Convert-SubtitleFile (Expand-PathValue $Once) $config -Force

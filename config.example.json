@@ -11,6 +11,17 @@
   "recursive": true,
   "scanIntervalSeconds": 20,
   "batchSize": 20,
+  "maxParallelRequests": 1,
+  "modelPool": [
+    {
+      "model": "gpt-4o-mini"
+    },
+    {
+      "apiBaseUrl": "https://another-openai-compatible.example/v1",
+      "apiKey": "optional-provider-specific-api-key",
+      "model": "another-fast-model"
+    }
+  ],
   "temperature": 0.2,
   "maxTokens": 2000,
   "requestTimeoutSeconds": 120,
@@ -21,4 +32,3 @@
   "translatedSuffix": "zh-CN",
   "bilingualSuffix": "bilingual"
 }
-
