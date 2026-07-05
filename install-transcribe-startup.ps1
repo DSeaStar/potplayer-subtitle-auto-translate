@@ -26,10 +26,9 @@ $args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptP
 $action = New-ScheduledTaskAction -Execute $powershell -Argument $args
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5)
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Watch downloaded videos and pre-generate PotPlayer subtitles with Faster-Whisper-XXL." -Force | Out-Null
 
 Write-Host "Installed startup task: $TaskName"
 Write-Host "Config path: $ConfigPath"
-

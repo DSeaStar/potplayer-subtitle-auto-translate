@@ -60,6 +60,7 @@ function Read-Config {
     return [pscustomobject]@{
         WhisperExe = $whisperExe
         Model = $model
+        ModelDir = Expand-PathValue ([string](Get-Prop $cfg "modelDir" ""))
         WatchDirs = $watchDirs
         Recursive = [bool](Get-Prop $cfg "recursive" $true)
         ScanIntervalSeconds = [int](Get-Prop $cfg "scanIntervalSeconds" 30)
@@ -167,6 +168,9 @@ function Get-WhisperArgs {
         "--compute_type", $Config.ComputeType
     )
 
+    if ($Config.ModelDir.Trim().Length -gt 0) {
+        $args += @("--model_dir", $Config.ModelDir.Trim())
+    }
     if ($Config.Language.Trim().Length -gt 0) {
         $args += @("--language", $Config.Language.Trim())
     }
@@ -198,19 +202,19 @@ function Invoke-VideoTranscription {
     $file = Get-Item -LiteralPath $VideoPath
     if ($Config.VideoExtensions -notcontains $file.Extension.ToLowerInvariant()) {
         Write-Log "Skipping unsupported file: $VideoPath"
-        return
+        return "skipped"
     }
     if (Test-TemporaryDownloadName $VideoPath) {
         Write-Log "Skipping temporary download file: $VideoPath"
-        return
+        return "pending"
     }
     if (-not $Force -and (Test-SubtitleExists $VideoPath $Config)) {
         Write-Log "Skipping video with existing subtitle: $VideoPath"
-        return
+        return "skipped"
     }
     if (-not (Test-FileStable $file $Config)) {
         Write-Log "Skipping unstable video file: $VideoPath"
-        return
+        return "pending"
     }
 
     $before = @(Get-MatchingSubtitleFiles $VideoPath $Config | ForEach-Object { $_.FullName })
@@ -228,6 +232,10 @@ function Invoke-VideoTranscription {
     if ($exitCode -ne 0) {
         throw "Whisper exited with code $exitCode"
     }
+    $joinedOutput = ($output | ForEach-Object { [string]$_ }) -join "`n"
+    if ($joinedOutput -match "Unknown model|Traceback|error:|Exception") {
+        throw "Whisper reported an error. Check watcher.log for details."
+    }
 
     $after = @(Get-MatchingSubtitleFiles $VideoPath $Config | ForEach-Object { $_.FullName })
     $created = @($after | Where-Object { $before -notcontains $_ })
@@ -237,8 +245,10 @@ function Invoke-VideoTranscription {
         }
     }
     else {
-        Write-Log "Transcription finished; no new subtitle detected for: $VideoPath"
+        Write-Log "Transcription finished; no subtitle was created for: $VideoPath"
+        return "skipped"
     }
+    return "done"
 }
 
 function Get-CandidateVideoFiles {
@@ -281,14 +291,20 @@ function Watch-Videos {
                 }
 
                 if (-not $state.ContainsKey($path) -or $state[$path] -ne $stamp) {
+                    $status = "failed"
                     try {
-                        Invoke-VideoTranscription $path $Config
+                        $status = Invoke-VideoTranscription $path $Config
                     }
                     catch {
                         Write-Log ("Error transcribing {0}: {1}" -f $path, $_.Exception.Message)
+                        if ($_.Exception.Message -match "Unknown cover type") {
+                            $status = "skipped"
+                        }
                     }
-                    $state[$path] = $stamp
-                    Save-JsonMap $state $statePath
+                    if ($status -eq "done" -or $status -eq "skipped") {
+                        $state[$path] = $stamp
+                        Save-JsonMap $state $statePath
+                    }
                 }
             }
 
@@ -316,4 +332,3 @@ if ($NoWatch) {
 }
 
 Watch-Videos $config
-

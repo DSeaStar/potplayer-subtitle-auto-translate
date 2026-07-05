@@ -65,6 +65,7 @@ Playback uses normal local subtitle files, so it does not wait for real-time mod
 
    - `whisperExe`
    - `model`
+   - `modelDir`
    - `watchDirs`
 
 3. Install startup task:

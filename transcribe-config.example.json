@@ -1,6 +1,7 @@
 {
   "whisperExe": "D:\\Program Files\\DAUM\\PotPlayer\\Engine\\Faster-Whisper-XXL\\faster-whisper-xxl.exe",
-  "model": "D:\\Program Files\\DAUM\\PotPlayer\\Model\\faster-whisper-large-v3-turbo",
+  "model": "large-v3-turbo",
+  "modelDir": "D:\\Program Files\\DAUM\\PotPlayer\\Model",
   "watchDirs": [
     "%USERPROFILE%\\Videos",
     "%USERPROFILE%\\Downloads",
@@ -38,4 +39,3 @@
   "skipExisting": true,
   "extraArgs": []
 }
-
